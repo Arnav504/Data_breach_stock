@@ -1,0 +1,22 @@
+# R
+.RData
+.Rhistory
+.Rproj.user
+*.Rproj
+*.Ruserdata
+
+# Knitted outputs (optional: remove if you want to track HTML)
+*.html
+*.pdf
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# Large or sensitive data (uncomment if you add such files)
+# *.csv

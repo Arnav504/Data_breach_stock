@@ -1,0 +1,391 @@
+---
+title: "Data Breach Disclosures and Firm Financial Outcomes"
+author: "Phase 2 Project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center",
+  dpi = 100
+)
+# Optional: use cache = TRUE on the stock-fetch chunk after first run to speed re-knitting
+```
+
+# Setup
+
+```{r setup-packages}
+# Set working directory so relative paths resolve correctly.
+setwd("/Users/arnavsahai/Desktop/Data Analysis for Policy Research using R/Project")
+
+library(tidyverse)
+library(tidyquant)
+library(lubridate)
+library(ggplot2)
+library(knitr)
+```
+
+# Load and Clean Breach Data
+
+Source: Rosati & Lynn (2020), Mendeley Data. We parse dates, keep standard breach types, add labels, and drop rows with missing ticker or event date. `confound_dum` flags events with another major announcement within 10 days.
+
+```{r load-breaches}
+breaches_raw <- read_csv("Data Breach Dataset.csv", show_col_types = FALSE)
+
+breaches <- breaches_raw %>%
+  mutate(event_date = dmy(event_date)) %>%
+  filter(breach_type %in% c("HACK", "INSD", "PORT",
+                            "DISC", "CARD", "PHYS",
+                            "STAT", "UNKN")) %>%
+  mutate(breach_type_label = case_when(
+    breach_type == "HACK" ~ "Hacking",
+    breach_type == "INSD" ~ "Insider",
+    breach_type == "PORT" ~ "Portable Device",
+    breach_type == "DISC" ~ "Unintended Disclosure",
+    breach_type == "CARD" ~ "Card Fraud",
+    breach_type == "PHYS" ~ "Physical Loss",
+    breach_type == "STAT" ~ "Stationary Device",
+    breach_type == "UNKN" ~ "Unknown"
+  )) %>%
+  mutate(breach_size = as.numeric(breach_size)) %>%
+  filter(!is.na(ticker), !is.na(event_date)) %>%
+  select(Event_ID, ticker, name, event_date, event_year,
+         breach_type, breach_type_label, breach_size,
+         confound_dum, confound_type, hq_state)
+```
+
+# Market Returns (S&P 500)
+
+We pull S&P 500 daily prices and convert to log returns for the market model.
+
+```{r market-returns}
+sp500_prices <- tq_get("^GSPC", get = "stock.prices",
+                       from = "2003-01-01", to = "2016-01-01")
+
+sp500_ret <- sp500_prices %>%
+  tq_transmute(select = adjusted, mutate_fun = periodReturn,
+               period = "daily", type = "log", col_rename = "mkt_ret") %>%
+  mutate(date = as.Date(date))
+```
+
+# Firm-Level Event Study
+
+For each breach event we fetch prices, compute returns, estimate the market model (estimation window -200 to -11), and compute AR/CAR in the event window (-5 to +10). Progress is hidden when knitting to keep the document readable.
+
+```{r event-study-loop, results="hide", cache=FALSE}
+results <- list()
+
+for (i in 1:nrow(breaches)) {
+  ticker_i   <- breaches$ticker[i]
+  event_date <- breaches$event_date[i]
+
+  if (i %% 50 == 0) message("Processing event ", i, " of ", nrow(breaches))
+
+  prices <- tryCatch({
+    tq_get(ticker_i, get = "stock.prices",
+           from = event_date - 300,
+           to   = event_date + 45)
+  }, error = function(e) NULL)
+
+  if (!is.data.frame(prices) || nrow(prices) < 1) next
+
+  firm_ret <- prices %>%
+    tq_transmute(select = adjusted, mutate_fun = periodReturn,
+                 period = "daily", type = "log", col_rename = "firm_ret") %>%
+    mutate(date = as.Date(date))
+
+  merged <- firm_ret %>%
+    inner_join(sp500_ret, by = "date") %>%
+    arrange(date) %>%
+    mutate(t = row_number() - which.min(abs(as.numeric(date - event_date))))
+
+  est_window <- merged %>% filter(t >= -200, t <= -11)
+  if (nrow(est_window) < 60) next
+
+  ols <- lm(firm_ret ~ mkt_ret, data = est_window)
+  alpha_hat <- coef(ols)[1]
+  beta_hat <- coef(ols)[2]
+
+  ev_window <- merged %>%
+    filter(t >= -5, t <= 10) %>%
+    mutate(
+      expected_ret = alpha_hat + beta_hat * mkt_ret,
+      ar           = firm_ret - expected_ret,
+      car          = cumsum(ar),
+      car_0_10     = cumsum(if_else(t >= 0, ar, 0)),
+      ticker       = ticker_i,
+      event_date   = event_date,
+      Event_ID     = breaches$Event_ID[i]
+    )
+
+  results[[i]] <- ev_window
+  Sys.sleep(0.3)
+}
+
+stock_panel <- bind_rows(results)
+```
+
+# Panel and Merge
+
+```{r panel-merge}
+stock_panel <- stock_panel %>%
+  mutate(Post_it = as.integer(t >= 0),
+         days_since_disclosure = t)
+
+# Events in panel vs skipped
+n_events_panel <- n_distinct(stock_panel$Event_ID)
+```
+
+We have `r n_events_panel` events in the stock panel.
+
+```{r missing-events}
+missing <- breaches %>%
+  filter(!Event_ID %in% stock_panel$Event_ID) %>%
+  select(Event_ID, ticker, name, event_date)
+
+kable(head(missing, 15), caption = "Sample of skipped events (delisted/renamed tickers)")
+```
+
+```{r merge-breach-chars}
+stock_panel <- stock_panel %>%
+  left_join(breaches %>% select(Event_ID, breach_type, breach_type_label,
+                        breach_size, confound_dum, hq_state, event_year),
+            by = "Event_ID")
+```
+
+# Appendix Graph 1: Top 10 Worst Performers
+
+```{r graph1-top10-worst, fig.cap="Top 10 worst stock performers by CAR(0,+10); confounded events excluded."}
+top10_worst <- stock_panel %>%
+  filter(t == 10, confound_dum == 0) %>%
+  arrange(car_0_10) %>%
+  slice_head(n = 10) %>%
+  select(Event_ID, ticker, event_date, car_0_10) %>%
+  mutate(label = paste0(ticker, "\n", format(event_date, "%b %Y")))
+
+panel_data_worst <- stock_panel %>%
+  filter(Event_ID %in% top10_worst$Event_ID) %>%
+  left_join(top10_worst %>% select(Event_ID, label), by = "Event_ID")
+
+ggplot(panel_data_worst, aes(x = t, y = car)) +
+  geom_line(color = "#E63946", linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 0.5) +
+  geom_hline(yintercept = 0, color = "grey50", linewidth = 0.4) +
+  geom_ribbon(aes(ymin = car, ymax = 0), fill = "#E63946", alpha = 0.15) +
+  facet_wrap(~ label, ncol = 5) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(title = "Top 10 Worst Stock Performers After Data Breach Disclosure",
+       subtitle = "Ranked by CAR(0, +10) | Confounded events excluded",
+       x = "Trading Days Relative to Disclosure",
+       y = "Cumulative Abnormal Return") +
+  theme_minimal() +
+  theme(strip.text = element_text(face = "bold", size = 9),
+        panel.grid.minor = element_blank())
+```
+
+# Appendix Graph 2: Mean CAR by Breach Type
+
+```{r graph2-car-by-type, fig.cap="Average CAR(0,+10) by breach type (four common types)."}
+four_types <- c("Hacking", "Insider", "Portable Device", "Unintended Disclosure")
+car10_by_type <- stock_panel %>%
+  filter(t == 10, confound_dum == 0, breach_type_label %in% four_types) %>%
+  group_by(breach_type_label) %>%
+  summarise(
+    n = n(),
+    mean_car = mean(car_0_10, na.rm = TRUE),
+    median_car = median(car_0_10, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(breach_type_label = fct_reorder(breach_type_label, mean_car))
+
+ggplot(car10_by_type, aes(x = breach_type_label, y = mean_car, fill = mean_car < 0)) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  scale_fill_manual(values = c("TRUE" = "#E63946", "FALSE" = "#2A9D8F")) +
+  coord_flip() +
+  labs(
+    title = "Average 10-Day Cumulative Abnormal Return by Breach Type",
+    subtitle = "CAR(0, +10) | Confounded events excluded",
+    x = NULL,
+    y = "Mean CAR(0, +10)"
+  ) +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank())
+```
+
+# Additional Data Analysis
+
+## Summary statistics
+
+```{r summary-stats}
+breach_summary <- breaches %>%
+  summarise(
+    n_events = n(),
+    n_confounded = sum(confound_dum == 1, na.rm = TRUE),
+    pct_confounded = 100 * mean(confound_dum, na.rm = TRUE),
+    breach_size_median = median(breach_size, na.rm = TRUE),
+    breach_size_mean = mean(breach_size, na.rm = TRUE),
+    breach_size_sd = sd(breach_size, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+kable(breach_summary, digits = 2, caption = "Breach sample summary")
+```
+
+```{r events-by-year}
+events_by_year <- breaches %>%
+  count(event_year, name = "n_events") %>%
+  arrange(event_year)
+
+kable(events_by_year, caption = "Events by year")
+```
+
+```{r events-by-type}
+events_by_type <- breaches %>%
+  count(breach_type_label, name = "n_events") %>%
+  arrange(desc(n_events))
+
+kable(events_by_type, caption = "Events by breach type")
+```
+
+## Average AR and CAR path
+
+```{r ar-by-t}
+ar_by_t <- stock_panel %>%
+  filter(confound_dum == 0) %>%
+  group_by(t) %>%
+  summarise(
+    mean_ar = mean(ar, na.rm = TRUE),
+    mean_car = mean(car, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+```
+
+```{r plot-mean-ar, fig.cap="Mean abnormal return by event day t."}
+ggplot(ar_by_t, aes(x = t, y = mean_ar)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.4) +
+  geom_vline(xintercept = -0.5, linetype = "dashed", color = "black") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.01)) +
+  labs(title = "Average Abnormal Return by Event Day",
+       subtitle = "Non-confounded events only | Disclosure at t = 0",
+       x = "Trading days relative to disclosure", y = "Mean abnormal return") +
+  theme_minimal() + theme(panel.grid.minor = element_blank())
+```
+
+```{r plot-mean-car, fig.cap="Mean cumulative abnormal return by event day t."}
+ggplot(ar_by_t, aes(x = t, y = mean_car)) +
+  geom_line(color = "darkred", linewidth = 1) +
+  geom_point(color = "darkred", size = 2) +
+  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.4) +
+  geom_vline(xintercept = -0.5, linetype = "dashed", color = "black") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(title = "Average Cumulative Abnormal Return by Event Day",
+       subtitle = "Non-confounded events only | Disclosure at t = 0",
+       x = "Trading days relative to disclosure", y = "Mean CAR") +
+  theme_minimal() + theme(panel.grid.minor = element_blank())
+```
+
+## Cross-sectional analysis
+
+```{r car-cross}
+car_cross <- stock_panel %>%
+  filter(t == 10, confound_dum == 0) %>%
+  select(Event_ID, ticker, car_0_10, breach_size, breach_type, breach_type_label, event_year) %>%
+  distinct() %>%
+  mutate(log_breach_size = log(1 + breach_size))
+
+car_summary <- car_cross %>%
+  summarise(
+    n = n(),
+    mean_car = mean(car_0_10, na.rm = TRUE),
+    median_car = median(car_0_10, na.rm = TRUE),
+    sd_car = sd(car_0_10, na.rm = TRUE),
+    min_car = min(car_0_10, na.rm = TRUE),
+    max_car = max(car_0_10, na.rm = TRUE)
+  )
+
+kable(car_summary, digits = 4, caption = "CAR(0,+10) summary (non-confounded)")
+```
+
+```{r regressions}
+lm_car_size_type <- lm(car_0_10 ~ log_breach_size + factor(breach_type), data = car_cross)
+lm_car_type <- lm(car_0_10 ~ factor(breach_type), data = car_cross)
+```
+
+**Regression: CAR(0,+10) on log breach size and breach type**
+
+```{r summary-lm-size-type}
+summary(lm_car_size_type)
+```
+
+**Regression: CAR(0,+10) on breach type only**
+
+```{r summary-lm-type}
+summary(lm_car_type)
+```
+
+## CAR by breach size bins
+
+```{r car-by-bins, fig.cap="Mean CAR(0,+10) by breach size bin."}
+car_cross_bins <- car_cross %>%
+  mutate(
+    size_bin = case_when(
+      is.na(breach_size) | breach_size == 0 ~ "Missing/0",
+      breach_size < 1000 ~ "<1k",
+      breach_size < 10000 ~ "1k–10k",
+      breach_size < 100000 ~ "10k–100k",
+      TRUE ~ "100k+"
+    ),
+    size_bin = factor(size_bin, levels = c("Missing/0", "<1k", "1k–10k", "10k–100k", "100k+"))
+  ) %>%
+  group_by(size_bin) %>%
+  summarise(n = n(), mean_car = mean(car_0_10, na.rm = TRUE), .groups = "drop")
+
+ggplot(car_cross_bins, aes(x = size_bin, y = mean_car, fill = mean_car < 0)) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  scale_fill_manual(values = c("TRUE" = "#E63946", "FALSE" = "#2A9D8F")) +
+  labs(title = "Average CAR(0,+10) by Breach Size", subtitle = "Non-confounded events only",
+       x = "Breach size", y = "Mean CAR(0,+10)") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(), axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+## EDA: Events over time and breach size distribution
+
+```{r plot-events-year, fig.cap="Breach disclosures by year."}
+ggplot(events_by_year, aes(x = event_year, y = n_events)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  labs(title = "Data breach disclosures by year",
+       subtitle = "Sample: NYSE/NASDAQ firms, 2005–2015",
+       x = "Year", y = "Number of events") +
+  theme_minimal() + theme(panel.grid.minor = element_blank())
+```
+
+```{r plot-breach-size-dist, fig.cap="Distribution of breach size (records exposed)."}
+ggplot(breaches %>% filter(!is.na(breach_size), breach_size > 0), aes(x = breach_size / 1000)) +
+  geom_histogram(bins = 40, fill = "steelblue", alpha = 0.8, boundary = 0) +
+  scale_x_continuous(labels = function(x) paste0(x, "k")) +
+  labs(title = "Distribution of breach size (records exposed)",
+       subtitle = "Excluding missing and zero",
+       x = "Breach size (thousands of records)", y = "Count") +
+  theme_minimal() + theme(panel.grid.minor = element_blank())
+```
