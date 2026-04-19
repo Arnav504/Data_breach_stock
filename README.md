@@ -18,6 +18,105 @@ Supporting documentation: **`EDA_DOCUMENTATION.md`** (EDA and variable definitio
 
 ---
 
+## Project logic: step-by-step flow
+
+This section is the **end-to-end story** of the repo: what happens first, what splits, and what each branch produces.
+
+### Overview
+
+1. **Input:** Breach-level rows (ticker, disclosure date, breach type, size, confound flags, etc.).
+2. **Enrichment:** Download **daily** stock prices for each affected ticker and for the **S&P 500** (`^GSPC`) from Yahoo Finance via **`tidyquant`**.
+3. **Two analyses (same research theme, different statistics):**
+   - **Event study** (`Data_Breaches.R` / `Data_Breaches.Rmd`): learn “normal” firm–market co-movement **before** disclosure, then measure **abnormal** and **cumulative abnormal returns** around disclosure.
+   - **Callaway–Sant’Anna** (`CS estimator.R`): stack **firm vs index** cumulative-return paths on the **same** trading-day window around each event and estimate **dynamic treatment effects** with **`did`**.
+
+```mermaid
+flowchart TD
+  A[Read Data Breach Dataset.csv] --> B[Parse dates and clean breach rows]
+  B --> C[Download firm and S&P 500 daily prices]
+  C --> D{Which script?}
+  D -->|Data_Breaches| E[Align returns in event time t]
+  E --> F[Fit market model on pre-window]
+  F --> G[Compute AR and CAR in event window]
+  G --> H[EDA plots tables regressions]
+  D -->|CS estimator| I[Build firm vs S&P cumulative paths per event]
+  I --> J[Stack panel period G weights covariates]
+  J --> K["att_gt then aggte dynamic"]
+  K --> L[Save plot CSV RDS]
+```
+
+### Steps shared by both pipelines
+
+| Step | Action | Why |
+|------|--------|-----|
+| 1 | **Read** `Data Breach Dataset.csv` | Source of disclosure dates and tickers. |
+| 2 | **Parse** `event_date` with `lubridate::dmy()` | Ensures dates sort and align with price data. |
+| 3 | **Filter** rows (ticker/date present; breach types; confounds) | Keeps analyzable events; rules **differ slightly** between scripts (see note below). |
+| 4 | **Fetch prices** for relevant tickers and `^GSPC` over calendar ranges that cover all events (plus padding) | Builds daily return series for firms and the market. |
+
+**Sample rules differ:** `Data_Breaches.*` keeps more breach-type codes (including `HACK` and `PHYS`) and often **excludes** `confound_dum == 1` only in figures and regressions. `CS estimator.R` uses a **narrower** set of breach types and drops **confounded** events when building the breach table. Do not expect identical event counts across scripts.
+
+---
+
+### Path A — Event study (`Data_Breaches.Rmd` / `Data_Breaches.R`)
+
+Executed in order inside the main loop (after S&P returns are built once):
+
+| Step | Action | Detail |
+|------|--------|--------|
+| A1 | **Loop** over each breach row | One iteration = one `Event_ID`. |
+| A2 | **Download** that firm’s daily prices | Window around `event_date` (with buffer); failures skip the event. |
+| A3 | **Compute** daily **log** returns | Firm and S&P; merge on **calendar date**. |
+| A4 | **Define event time `t`** | Trading-day index with **`t = 0`** anchored to the disclosure date (nearest trading day in the merged series). |
+| A5 | **Estimation window** | Restrict to **`t ∈ [-200, -11]`** (pre-disclosure only). Require at least **60** trading days; else **skip**. |
+| A6 | **Market model** | OLS: `firm_ret ~ mkt_ret` on the estimation window → intercept **α̂** and slope **β̂**. |
+| A7 | **Event window** | Restrict to **`t ∈ [-5, +10]`**. |
+| A8 | **Expected return** | `expected_ret = α̂ + β̂ × mkt_ret` each day in the event window. |
+| A9 | **Abnormal return (AR)** | `ar = firm_ret - expected_ret`. |
+| A10 | **CAR** | `car = cumsum(ar)` over the event window (cumulative from **t = −5**). |
+| A11 | **CAR(0, +10)** | `car_0_10` cumulates AR only for **`t ≥ 0`**; at **`t = 10`** it equals **CAR(0, +10)** — the main outcome for rankings, bins, and regressions. |
+| A12 | **Stack** all events | `bind_rows` → **`stock_panel`** (one row per event × day). |
+| A13 | **Merge** breach characteristics | Types, size, `confound_dum`, etc., for plots and heterogeneity. |
+| A14 | **Analyze** | Summary tables; mean AR/CAR by `t`; top “worst” paths; CAR by type/size; `lm()` on CAR(0,+10); optional knit to **HTML** from the `.Rmd`. |
+
+**One-sentence summary:** *Before the news, estimate how the stock moves with the market; after the news, measure how returns differ from that pre-estimated relationship.*
+
+---
+
+### Path B — Callaway–Sant’Anna (`CS estimator.R`)
+
+The script runs **two specifications** in one file. The **second** clears the workspace (`rm(list = ls())`), reloads data, and is the version that **writes files** to disk.
+
+| Step | Action | Detail |
+|------|--------|--------|
+| B1 | **Clean breaches** | Subset of breach types; **`confound_dum == 0`** in the breach table; dedupe by `Event_ID`. |
+| B2 | **Pull prices** | Firm tickers and S&P; Version 2 uses **more pre-event calendar history** for covariates. |
+| B3 | **Daily simple returns** | Version 2 uses `adjusted / lag(adjusted) - 1` (see **`CS_ESTIMATOR_DOCUMENTATION.md`** for Version 1). |
+| B4 | **Per event: trading window** | Calendar pad around `event_date`; **first trading day on or after** `event_date` → **`event_time = 0`**. |
+| B5 | **Cumulative returns** | For the firm and for the S&P, **`cumsum`** of daily returns over the **same** aligned trading dates in the window. |
+| B6 | **Two “units” per event** | **Treated:** firm path (`F_<Event_ID>`). **Control:** S&P path (`M_<Event_ID>`) entered as **never-treated** in `did`. |
+| B7 | **Map to `did` inputs** | Positive **`period`**, cohort **`G`** (firm vs market); **`id_num`** identifies each stacked series. |
+| B8 | **Weights** | Functions of **breach size** (log); Version 2 **normalizes** treated weights to mean 1. |
+| B9 | **Covariates (Version 2)** | Pre-event volatility, momentum, and log price; events drop if covariates are missing. **`att_gt`** uses `xformla = ~ pre_mom + log_size` in the final spec. |
+| B10 | **Estimate** | `did::att_gt` (doubly robust) → `aggte(..., type = "dynamic")` for the **event-time path** of effects. |
+| B11 | **Output (Version 2)** | `CS_event_study.png`, `CS_event_study_estimates.csv`, `att_gt_object.rds`. |
+
+**One-sentence summary:** *For each breach, compare the firm’s cumulative return path to the index path on the same trading days, then estimate average differences over event time with CS / `did`.*
+
+---
+
+### How Path A and Path B differ (same theme, not identical numbers)
+
+| Topic | Event study (`Data_Breaches.*`) | CS estimator (`CS estimator.R`) |
+|--------|----------------------------------|----------------------------------|
+| **“Normal” benchmark** | α + β × market, fit **before** `t = 0` | **No** α/β; compare firm **cum** return to S&P **cum** return on same dates |
+| **Returns** | **Log** daily returns | **Simple** daily returns (explicit in Version 2) |
+| **Main outcome object** | AR, CAR, **CAR(0,+10)** | Panel outcome **`y`** = cumulative return from window start |
+| **Inference** | Descriptive paths + **`lm()`** on CAR(0,+10) | **`did`**: group–time ATT, bootstrap, dynamic aggregation |
+| **Docs** | `EDA_DOCUMENTATION.md`, `PLOTS_EXPLANATION.md` | `CS_ESTIMATOR_DOCUMENTATION.md` |
+
+---
+
 ## Repository layout
 
 | Path | Description |
@@ -103,7 +202,9 @@ The file runs **two** specifications in sequence; the second block starts with `
 
 ---
 
-## Methods (short)
+## Methods summary
+
+The **ordered steps**, **branching**, and **comparison table** are in **[Project logic: step-by-step flow](#project-logic-step-by-step-flow)** above. This subsection is a compact formula reference.
 
 ### Event study (`Data_Breaches.*`)
 
@@ -117,11 +218,7 @@ See **`EDA_DOCUMENTATION.md`** for variable-level detail and **`PLOTS_EXPLANATIO
 
 ### CS estimator (`CS estimator.R`)
 
-Full detail: **`CS_ESTIMATOR_DOCUMENTATION.md`**. In short:
-
-- Aligns **firm** and **S&P 500** daily returns on the same calendar span around each breach; outcome **y** is **cumulative return** from the start of the window (interpretable as a CAR-style object in levels).  
-- **Never-treated** arm: market index series with **`G = 0`**; treated firm arm gets a cohort **`G`** set so treatment turns on at the mapped period (see the CS doc for Version 1 vs Version 2 `period` / `G` coding).  
-- Uses **`did::att_gt`** with `control_group = "nevertreated"`, `panel = FALSE`, doubly robust estimation, bootstrap inference; second spec adds covariates and normalized breach-size weights.
+Full formulas, `period` / `G` coding (Version 1 vs 2), covariates, weights, and outputs: **`CS_ESTIMATOR_DOCUMENTATION.md`**. In short: **`did::att_gt`** with `control_group = "nevertreated"`, `panel = FALSE`, doubly robust estimation, bootstrap inference; the saved plot and CSV come from the **second** specification in the script.
 
 ---
 
