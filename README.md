@@ -222,6 +222,20 @@ Full formulas, `period` / `G` coding (Version 1 vs 2), covariates, weights, and 
 
 ---
 
+## Why use the CS estimator?
+
+We include the CS estimator as a **complement** to the classic event study, not a replacement.
+
+- **Second benchmark for \"normal\" performance:** The event study uses a pre-event market model (`alpha + beta * market return`). The CS script instead compares **firm cumulative return paths** to **S&P cumulative paths** on the same trading days around disclosure.
+- **Dynamic effect path with formal inference:** `att_gt` + `aggte(type = "dynamic")` gives an event-time effect curve with bootstrap-based uncertainty, rather than relying only on average AR/CAR plots.
+- **Doubly robust specification and covariates:** Version 2 adds covariates (for example pre-event momentum and log size) in a DR framework to reduce sensitivity to simple unadjusted comparisons.
+- **Policy-relevant weighting:** Breach-size-based weights let larger incidents matter more while normalization in Version 2 prevents a few mega-events from dominating.
+- **Robustness check across methods:** If conclusions are similar in both pipelines (classic event study and CS), confidence in the substantive finding is stronger.
+
+In short, the CS branch helps answer the same research question with a **different identification lens** and stronger event-time inference.
+
+---
+
 ## Limitations (high level)
 
 - Many tickers fail price download or lack enough pre-event history → **sample size for stock panel < full breach count** (skipped events are tabulated in the Rmd).  
